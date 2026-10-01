@@ -43,6 +43,16 @@ type InclusionProof struct {
 	Siblings         []Hash `json:"siblings"`
 }
 
+// ProofRequest names one transaction together with the exact position, block
+// and trust root the caller expects. A joint packet never moves a request to
+// a different index or block, even when the same transaction appears twice.
+type ProofRequest struct {
+	Transaction   []byte `json:"transaction"`
+	BlockHash     Hash   `json:"blockHash"`
+	Index         uint64 `json:"index"`
+	TrustRootHash Hash   `json:"trustRootHash"`
+}
+
 type ResultStatus string
 
 const (
@@ -53,17 +63,18 @@ const (
 // VerificationResult is an audit record. A previously accepted record is not a
 // current credential: reopening the store forces fresh canonical-chain checks.
 type VerificationResult struct {
-	ID               Hash         `json:"id"`
-	Status           ResultStatus `json:"status"`
-	ObservedAt       time.Time    `json:"observedAt"`
-	TrustRootHash    Hash         `json:"trustRootHash"`
-	CanonicalTip     Hash         `json:"canonicalTip"`
-	BlockHash        Hash         `json:"blockHash"`
-	BlockHeight      uint64       `json:"blockHeight"`
-	TransactionHash  Hash         `json:"transactionHash"`
-	TransactionIndex uint64       `json:"transactionIndex"`
-	Confirmations    uint64       `json:"confirmations"`
-	Reason           string       `json:"reason"`
+	ID                    Hash         `json:"id"`
+	Status                ResultStatus `json:"status"`
+	ObservedAt            time.Time    `json:"observedAt"`
+	TrustRootHash         Hash         `json:"trustRootHash"`
+	CanonicalTip          Hash         `json:"canonicalTip"`
+	BlockHash             Hash         `json:"blockHash"`
+	BlockHeight           uint64       `json:"blockHeight"`
+	TransactionHash       Hash         `json:"transactionHash"`
+	TransactionIndex      uint64       `json:"transactionIndex"`
+	Confirmations         uint64       `json:"confirmations"`
+	RequiredConfirmations uint64       `json:"requiredConfirmations"`
+	Reason                string       `json:"reason"`
 }
 
 func SerializeHeader(header BlockHeader) []byte {

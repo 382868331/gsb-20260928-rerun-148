@@ -10,6 +10,7 @@ const DefaultConfirmations uint64 = 2
 
 type Chain struct {
 	consensus       Consensus
+	policy          ConfirmationPolicy
 	anchor          TrustRoot
 	headers         map[Hash]BlockHeader
 	parentByChild   map[Hash]Hash
@@ -45,12 +46,27 @@ func NewChain(anchor TrustRoot, consensus Consensus) (*Chain, error) {
 
 	return &Chain{
 		consensus:       consensus,
+		policy:          ConstantConfirmations(DefaultConfirmations),
 		anchor:          anchor,
 		headers:         map[Hash]BlockHeader{hash: anchor.Header},
 		parentByChild:   map[Hash]Hash{},
 		totalDifficulty: map[Hash]uint64{hash: anchor.Header.Difficulty},
 		canonicalTip:    hash,
 	}, nil
+}
+
+// SetConfirmationPolicy updates the freshness requirement without changing the
+// trust root or headers. Future verifications use the current policy; stored
+// audit results are never reinterpreted as current credentials.
+func (c *Chain) SetConfirmationPolicy(policy ConfirmationPolicy) {
+	if policy == nil {
+		policy = ConstantConfirmations(DefaultConfirmations)
+	}
+	c.policy = policy
+}
+
+func (c *Chain) ConfirmationPolicy() ConfirmationPolicy {
+	return c.policy
 }
 
 func (c *Chain) AddHeader(header BlockHeader) error {
@@ -191,6 +207,8 @@ func (c *Chain) CanonicalTip() Tip {
 	return Tip{Hash: c.canonicalTip, Height: header.Height, TotalDifficulty: c.totalDifficulty[c.canonicalTip]}
 }
 
+// BlockByHash returns a stored header for joint-proof construction. The caller
+// supplies complete transaction bodies through its own fixture block source.
 func (c *Chain) IsCanonical(hash Hash) bool {
 	if _, exists := c.headers[hash]; !exists {
 		return false
@@ -212,18 +230,19 @@ func (c *Chain) Confirmations(hash Hash) (uint64, error) {
 
 func (c *Chain) VerifyInclusion(proof InclusionProof, requiredConfirmations uint64) (result VerificationResult, err error) {
 	if requiredConfirmations == 0 {
-		requiredConfirmations = DefaultConfirmations
+		requiredConfirmations = c.policy.RequiredConfirmations(c.headers[proof.BlockHash].Height)
 	}
 	txHash := TransactionHash(proof.Transaction)
 	now := time.Now().UTC()
 	result = VerificationResult{
-		Status:           ResultRejected,
-		ObservedAt:       now,
-		TrustRootHash:    c.anchor.BlockHash,
-		CanonicalTip:     c.canonicalTip,
-		TransactionHash:  txHash,
-		TransactionIndex: proof.Index,
-		Reason:           "unknown",
+		Status:                ResultRejected,
+		ObservedAt:            now,
+		TrustRootHash:         c.anchor.BlockHash,
+		CanonicalTip:          c.canonicalTip,
+		TransactionHash:       txHash,
+		TransactionIndex:      proof.Index,
+		RequiredConfirmations: requiredConfirmations,
+		Reason:                "unknown",
 	}
 	defer func() {
 		result.ID = resultIdentityHash(result)
@@ -279,4 +298,5 @@ var (
 	ErrProofNotBound             = errors.New("proof is not bound to a recognized block")
 	ErrStaleFork                 = errors.New("proof binds an old branch")
 	ErrInsufficientConfirmations = errors.New("not enough confirmations")
+	ErrProofMissing              = errors.New("joint proof is missing a requested item")
 )

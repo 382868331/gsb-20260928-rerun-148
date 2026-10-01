@@ -13,6 +13,7 @@ const (
 	trustFile   = "trust-root.json"
 	headersFile = "header-chain.json"
 	resultsFile = "verification-results.json"
+	jointFile   = "joint-proofs.json"
 )
 
 type FileStore struct {
@@ -31,6 +32,10 @@ type headerStore struct {
 
 type resultStore struct {
 	Results []VerificationResult `json:"results"`
+}
+
+type jointStore struct {
+	Packets []JointProofPacket `json:"packets"`
 }
 
 func NewFileStore(dir string) *FileStore {
@@ -146,6 +151,66 @@ func (s *FileStore) LoadResults() ([]VerificationResult, error) {
 		return nil, err
 	}
 	return stored.Results, nil
+}
+
+// SaveJointProof stores a packet for later rechecks. The packet is evidence to
+// re-evaluate, never a trust source: its anchor must match the immutable trust
+// root, and the packet ID is recomputed instead of being accepted as supplied.
+func (s *FileStore) SaveJointProof(chain *Chain, packet *JointProofPacket) error {
+	if chain == nil {
+		return errors.New("chain is nil")
+	}
+	if packet == nil {
+		return errors.New("joint proof packet is nil")
+	}
+	if packet.TrustRootHash != chain.anchor.BlockHash {
+		return errors.New("joint proof is not bound to the stored trust root")
+	}
+	packet.ID = JointProofPacketIdentity(packet)
+	path := filepath.Join(s.dir, jointFile)
+	var stored jointStore
+	if err := readJSON(path, &stored); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	for _, existing := range stored.Packets {
+		if existing.ID == packet.ID {
+			return nil
+		}
+	}
+	stored.Packets = append(stored.Packets, *packet)
+	return writeJSON(path, stored)
+}
+
+func (s *FileStore) LoadJointProofs() ([]JointProofPacket, error) {
+	var stored jointStore
+	if err := readJSON(filepath.Join(s.dir, jointFile), &stored); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	packets := make([]JointProofPacket, 0, len(stored.Packets))
+	for _, packet := range stored.Packets {
+		recomputed := JointProofPacketIdentity(&packet)
+		if recomputed != packet.ID {
+			return nil, errors.New("stored joint proof packet identity has been modified")
+		}
+		packets = append(packets, packet)
+	}
+	return packets, nil
+}
+
+// RecheckJointProof evaluates a stored packet against the current canonical
+// chain and appends fresh audit records. Old accepted records are left
+// untouched and cannot make the current check pass.
+func (s *FileStore) RecheckJointProof(chain *Chain, packet *JointProofPacket, requiredConfirmations uint64) (BatchVerificationResult, error) {
+	batch, err := chain.VerifyJointProof(packet, requiredConfirmations)
+	for _, item := range batch.Results {
+		if appendErr := s.AppendResult(chain, item.Result); appendErr != nil {
+			return batch, appendErr
+		}
+	}
+	return batch, err
 }
 
 func sameTrustRoot(left, right TrustRoot) bool {

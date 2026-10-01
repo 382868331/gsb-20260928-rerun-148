@@ -15,6 +15,7 @@ func resultIdentityHash(result VerificationResult) Hash {
 	data = binary.BigEndian.AppendUint64(data, result.BlockHeight)
 	data = binary.BigEndian.AppendUint64(data, result.TransactionIndex)
 	data = binary.BigEndian.AppendUint64(data, result.Confirmations)
+	data = binary.BigEndian.AppendUint64(data, result.RequiredConfirmations)
 	data = appendTime(data, result.ObservedAt)
 	data = append(data, []byte(result.Reason)...)
 	return Hash(sha256Hash(data))

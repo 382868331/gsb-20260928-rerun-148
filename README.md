@@ -78,3 +78,34 @@ result, err := chain.VerifyInclusion(proof, 1)
 - 旧分支证明先通过、分叉切换后被撤回；
 - 重开后不能替换信任起点；
 - 被篡改或缺少祖先的持久化头不能加载。
+
+## 多笔交易的联合证明
+
+`BuildJointProofPacket` 按需为多个 `ProofRequest` 取得证明。每个请求显式携带交易原文、区块哈希、交易索引和信任起点哈希：
+
+- 同一区块的 Merkle 层级只计算一次，各位置共享兄弟哈希材料；
+- 每个条目仍绑定自己的位置、区块和信任起点，重复交易不能占用另一个索引的证明；
+- 找不到区块、索引越界或信任起点不一致的请求保留为 rejected 缺项，批量结果不会把缺项算作成功；
+- 数据包中的 `ClaimedTransactionsRoot` 只是元数据，验证时只使用本地连续验证过的区块头中的交易根。
+
+`Chain.VerifyJointProof` 在当前规范链上逐项重新执行 Merkle、绑定、规范链和确认数检查。`BatchVerificationResult.AllAccepted` 只有在全部条目通过时才为真；错误使用 `errors.Join` 汇总，可通过 `errors.Is` 检查 `ErrProofMissing`、`ErrStaleFork` 等具体原因。
+
+## 可更新的确认策略
+
+确认数要求通过 `ConfirmationPolicy` 接口提供：
+
+- `ConstantConfirmations` 提供固定确认数；
+- `HeightConfirmations` 支持按区块高度更新要求；
+- `ConfirmationPolicyFunc` 适配任意函数。
+
+调用 `Chain.SetConfirmationPolicy` 不会改变信任起点或头部链，只影响之后的验证。`VerifyInclusion`/`VerifyJointProof` 传入非零确认数时以调用者显式值为准；传 `0` 时查询当前策略。结果记录同时保存观察到的确认数和本次要求的确认数，便于审计边界。
+
+## 重组复检与历史证据
+
+`FileStore.SaveJointProof` 把数据包保存到 `joint-proofs.json`，保存和加载都会重算数据包身份，且必须绑定不可变信任起点。`RecheckJointProof` 重开后：
+
+1. 先从信任起点和父子关系重建头部链与规范链；
+2. 再对保存的每一项在当前规范链上重新验证；
+3. 旧的 accepted 审计记录保留不动，新的 rejected 记录追加到结果文件。
+
+历史结论、数据包自报根和自报身份都不是新的信任来源；切换到人工构造的更重分叉后，旧分支条目必须返回 `ErrStaleFork`。

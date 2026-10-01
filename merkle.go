@@ -31,6 +31,15 @@ func NewInclusionProof(transactions [][]byte, index uint64) InclusionProof {
 
 	count := uint64(len(transactions))
 	levels := buildMerkleLevels(transactions)
+	return InclusionProof{
+		Transaction:      append([]byte(nil), transactions[index]...),
+		Index:            index,
+		TransactionCount: count,
+		Siblings:         siblingsForIndex(levels, index, count),
+	}
+}
+
+func siblingsForIndex(levels [][]Hash, index uint64, count uint64) []Hash {
 	siblings := make([]Hash, 0, merkleDepth)
 	position := index
 	levelCount := count
@@ -45,14 +54,7 @@ func NewInclusionProof(transactions [][]byte, index uint64) InclusionProof {
 		position >>= 1
 		levelCount = (levelCount + 1) >> 1
 	}
-
-	return InclusionProof{
-		Transaction:      append([]byte(nil), transactions[index]...),
-		BlockHash:        Hash{},
-		Index:            index,
-		TransactionCount: count,
-		Siblings:         siblings,
-	}
+	return siblings
 }
 
 func NewInclusionProofForHeader(header BlockHeader, transactions [][]byte, index uint64) InclusionProof {
