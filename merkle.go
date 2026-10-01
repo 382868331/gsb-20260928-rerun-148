@@ -61,6 +61,24 @@ func NewInclusionProofForHeader(header BlockHeader, transactions [][]byte, index
 	return proof
 }
 
+// NewBatchInclusionProofForHeader builds a joint proof for several transaction
+// indexes of the same block, sharing the block binding and transaction count.
+func NewBatchInclusionProofForHeader(header BlockHeader, transactions [][]byte, indexes ...uint64) BatchInclusionProof {
+	batch := BatchInclusionProof{
+		BlockHash:        BlockHeaderHash(header),
+		TransactionCount: uint64(len(transactions)),
+	}
+	for _, index := range indexes {
+		proof := NewInclusionProof(transactions, index)
+		batch.Items = append(batch.Items, BatchProofItem{
+			Transaction: proof.Transaction,
+			Index:       proof.Index,
+			Siblings:    proof.Siblings,
+		})
+	}
+	return batch
+}
+
 func buildMerkleLevels(transactions [][]byte) [][]Hash {
 	level := make([]Hash, len(transactions))
 	for i, tx := range transactions {

@@ -15,6 +15,7 @@ type Chain struct {
 	parentByChild   map[Hash]Hash
 	totalDifficulty map[Hash]uint64
 	canonicalTip    Hash
+	policy          ConfirmationPolicy
 }
 
 type ChainSnapshot struct {
@@ -50,7 +51,23 @@ func NewChain(anchor TrustRoot, consensus Consensus) (*Chain, error) {
 		parentByChild:   map[Hash]Hash{},
 		totalDifficulty: map[Hash]uint64{hash: anchor.Header.Difficulty},
 		canonicalTip:    hash,
+		policy:          ConfirmationPolicy{MinConfirmations: DefaultConfirmations},
 	}, nil
+}
+
+// SetConfirmationPolicy updates the default confirmation requirement. It only
+// affects future verifications; previously accepted results stay historical
+// evidence and must be re-checked to reflect the new policy.
+func (c *Chain) SetConfirmationPolicy(policy ConfirmationPolicy) error {
+	if policy.MinConfirmations == 0 {
+		return errors.New("confirmation policy needs at least one confirmation")
+	}
+	c.policy = policy
+	return nil
+}
+
+func (c *Chain) ConfirmationPolicy() ConfirmationPolicy {
+	return c.policy
 }
 
 func (c *Chain) AddHeader(header BlockHeader) error {
@@ -212,18 +229,19 @@ func (c *Chain) Confirmations(hash Hash) (uint64, error) {
 
 func (c *Chain) VerifyInclusion(proof InclusionProof, requiredConfirmations uint64) (result VerificationResult, err error) {
 	if requiredConfirmations == 0 {
-		requiredConfirmations = DefaultConfirmations
+		requiredConfirmations = c.policy.MinConfirmations
 	}
 	txHash := TransactionHash(proof.Transaction)
 	now := time.Now().UTC()
 	result = VerificationResult{
-		Status:           ResultRejected,
-		ObservedAt:       now,
-		TrustRootHash:    c.anchor.BlockHash,
-		CanonicalTip:     c.canonicalTip,
-		TransactionHash:  txHash,
-		TransactionIndex: proof.Index,
-		Reason:           "unknown",
+		Status:                ResultRejected,
+		ObservedAt:            now,
+		TrustRootHash:         c.anchor.BlockHash,
+		CanonicalTip:          c.canonicalTip,
+		TransactionHash:       txHash,
+		TransactionIndex:      proof.Index,
+		RequiredConfirmations: requiredConfirmations,
+		Reason:                "unknown",
 	}
 	defer func() {
 		result.ID = resultIdentityHash(result)
@@ -260,6 +278,85 @@ func (c *Chain) VerifyInclusion(proof InclusionProof, requiredConfirmations uint
 	return result, nil
 }
 
+// VerifyInclusionBatch verifies several proofs against their named blocks.
+// Header lookups are shared, but every transaction is checked against its own
+// index, block and trust anchor. A missing or invalid item never counts as a
+// success: the per-item results are returned together with ErrBatchIncomplete.
+func (c *Chain) VerifyInclusionBatch(proofs []InclusionProof, requiredConfirmations uint64) ([]VerificationResult, error) {
+	if len(proofs) == 0 {
+		return nil, ErrEmptyBatch
+	}
+	results := make([]VerificationResult, len(proofs))
+	var firstErr error
+	for i, proof := range proofs {
+		result, err := c.VerifyInclusion(proof, requiredConfirmations)
+		results[i] = result
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if firstErr != nil {
+		return results, fmt.Errorf("%w: %w", ErrBatchIncomplete, firstErr)
+	}
+	return results, nil
+}
+
+// VerifyBatchInclusion verifies a joint proof that shares its block binding
+// across several transactions of the same block.
+func (c *Chain) VerifyBatchInclusion(batch BatchInclusionProof, requiredConfirmations uint64) ([]VerificationResult, error) {
+	if len(batch.Items) == 0 {
+		return nil, ErrEmptyBatch
+	}
+	return c.VerifyInclusionBatch(batch.Proofs(), requiredConfirmations)
+}
+
+// RecheckResult re-evaluates a historical result against the current chain
+// state. A previously accepted result is only evidence of a past observation;
+// after a reorg or a policy change it must be re-checked to mean anything now.
+func (c *Chain) RecheckResult(past VerificationResult, requiredConfirmations uint64) (VerificationResult, error) {
+	if requiredConfirmations == 0 {
+		requiredConfirmations = c.policy.MinConfirmations
+	}
+	fresh := VerificationResult{
+		Status:                ResultRejected,
+		ObservedAt:            time.Now().UTC(),
+		TrustRootHash:         c.anchor.BlockHash,
+		CanonicalTip:          c.canonicalTip,
+		BlockHash:             past.BlockHash,
+		TransactionHash:       past.TransactionHash,
+		TransactionIndex:      past.TransactionIndex,
+		RequiredConfirmations: requiredConfirmations,
+	}
+	header, exists := c.headers[past.BlockHash]
+	if !exists {
+		fresh.Reason = "block is not recognized by the current chain"
+		fresh.ID = resultIdentityHash(fresh)
+		return fresh, ErrProofNotBound
+	}
+	fresh.BlockHeight = header.Height
+	if !c.IsCanonical(past.BlockHash) {
+		fresh.Reason = "block left the canonical chain after a reorg"
+		fresh.ID = resultIdentityHash(fresh)
+		return fresh, ErrStaleFork
+	}
+	confirmations, err := c.Confirmations(past.BlockHash)
+	if err != nil {
+		fresh.Reason = err.Error()
+		fresh.ID = resultIdentityHash(fresh)
+		return fresh, err
+	}
+	fresh.Confirmations = confirmations
+	if confirmations < requiredConfirmations {
+		fresh.Reason = fmt.Sprintf("confirmations %d below required %d", confirmations, requiredConfirmations)
+		fresh.ID = resultIdentityHash(fresh)
+		return fresh, ErrInsufficientConfirmations
+	}
+	fresh.Status = ResultAccepted
+	fresh.Reason = "historical result still holds on the current canonical chain"
+	fresh.ID = resultIdentityHash(fresh)
+	return fresh, nil
+}
+
 func validateAnchor(anchor TrustRoot) error {
 	if anchor.Name == "" {
 		return errors.New("trust root needs a human-readable name")
@@ -279,4 +376,6 @@ var (
 	ErrProofNotBound             = errors.New("proof is not bound to a recognized block")
 	ErrStaleFork                 = errors.New("proof binds an old branch")
 	ErrInsufficientConfirmations = errors.New("not enough confirmations")
+	ErrEmptyBatch                = errors.New("batch verification needs at least one proof")
+	ErrBatchIncomplete           = errors.New("one or more proofs in the batch failed verification")
 )

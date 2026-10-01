@@ -33,6 +33,14 @@
 
 因此，旧分支上的证明即使本身路径正确，也会在分叉切换后返回 `ErrStaleFork`；伪造路径或把证明绑定到其他区块会返回 `ErrProofNotBound`。
 
+## 联合证明与确认策略
+
+`BatchInclusionProof` 把同一区块中多笔交易的证明合并：块哈希和交易总数只携带一次，每笔交易仍自带原文、索引和 Merkle 路径。`VerifyBatchInclusion` / `VerifyInclusionBatch` 逐笔独立验证并返回逐笔结果；任何一笔缺失或无效都会使整体返回 `ErrBatchIncomplete`，缺项不会被当作全部通过。重复出现的相同交易各自绑定自己的索引位置。
+
+确认数要求来自两处：调用方显式传入的值优先；传 `0` 时使用链上可更新的 `ConfirmationPolicy`（`SetConfirmationPolicy`，至少为 1，默认 `DefaultConfirmations`）。每次验证结果记录当时生效的 `RequiredConfirmations` 供审计。
+
+历史结果只是历史证据。`RecheckResult` 按当前规范链和当前策略重新检查一笔历史结果：链重组后旧块离开规范链会返回 `ErrStaleFork`，确认数不足返回 `ErrInsufficientConfirmations`，结果文件里自报的区块若不在已验证头链中则返回 `ErrProofNotBound`。重开后规范链判断只从信任起点和经验证的区块头重建，不从结果文件或旧结论扩展信任。
+
 ## 分叉切换
 
 链状态保存所有已连接的有效分叉头，但只把符合链选择规则的一条链标记为 canonical。切换到更长累计工作量分支后：
@@ -76,5 +84,9 @@ result, err := chain.VerifyInclusion(proof, 1)
 - 把证明绑定到交易根不同的其他区块；
 - 缺少父块时直接提交高块；
 - 旧分支证明先通过、分叉切换后被撤回；
+- 联合证明中篡改或缺失单笔不会拖垮或冒充其他笔；
+- 相同交易重复出现时各自绑定索引，越界索引被拒绝；
+- 确认数边界（恰好达到通过、少一拒绝）与可更新确认策略；
+- 重组后历史通过结果重检失效，但历史记录仍作为证据保留；
 - 重开后不能替换信任起点；
 - 被篡改或缺少祖先的持久化头不能加载。

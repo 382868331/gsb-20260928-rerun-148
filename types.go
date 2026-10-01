@@ -43,6 +43,43 @@ type InclusionProof struct {
 	Siblings         []Hash `json:"siblings"`
 }
 
+// BatchProofItem carries the per-transaction part of a joint proof. Each item
+// is still bound to its own index inside the committed transaction list.
+type BatchProofItem struct {
+	Transaction []byte `json:"transaction"`
+	Index       uint64 `json:"index"`
+	Siblings    []Hash `json:"siblings"`
+}
+
+// BatchInclusionProof shares the block binding and transaction count across
+// several transactions proved against the same block.
+type BatchInclusionProof struct {
+	BlockHash        Hash             `json:"blockHash"`
+	TransactionCount uint64           `json:"transactionCount"`
+	Items            []BatchProofItem `json:"items"`
+}
+
+// Proofs expands the joint proof into one fully bound proof per transaction.
+func (b BatchInclusionProof) Proofs() []InclusionProof {
+	proofs := make([]InclusionProof, 0, len(b.Items))
+	for _, item := range b.Items {
+		proofs = append(proofs, InclusionProof{
+			Transaction:      item.Transaction,
+			BlockHash:        b.BlockHash,
+			Index:            item.Index,
+			TransactionCount: b.TransactionCount,
+			Siblings:         item.Siblings,
+		})
+	}
+	return proofs
+}
+
+// ConfirmationPolicy is the chain-level default for how many confirmations a
+// proof must have. Callers can still demand more per verification.
+type ConfirmationPolicy struct {
+	MinConfirmations uint64 `json:"minConfirmations"`
+}
+
 type ResultStatus string
 
 const (
@@ -53,17 +90,18 @@ const (
 // VerificationResult is an audit record. A previously accepted record is not a
 // current credential: reopening the store forces fresh canonical-chain checks.
 type VerificationResult struct {
-	ID               Hash         `json:"id"`
-	Status           ResultStatus `json:"status"`
-	ObservedAt       time.Time    `json:"observedAt"`
-	TrustRootHash    Hash         `json:"trustRootHash"`
-	CanonicalTip     Hash         `json:"canonicalTip"`
-	BlockHash        Hash         `json:"blockHash"`
-	BlockHeight      uint64       `json:"blockHeight"`
-	TransactionHash  Hash         `json:"transactionHash"`
-	TransactionIndex uint64       `json:"transactionIndex"`
-	Confirmations    uint64       `json:"confirmations"`
-	Reason           string       `json:"reason"`
+	ID                    Hash         `json:"id"`
+	Status                ResultStatus `json:"status"`
+	ObservedAt            time.Time    `json:"observedAt"`
+	TrustRootHash         Hash         `json:"trustRootHash"`
+	CanonicalTip          Hash         `json:"canonicalTip"`
+	BlockHash             Hash         `json:"blockHash"`
+	BlockHeight           uint64       `json:"blockHeight"`
+	TransactionHash       Hash         `json:"transactionHash"`
+	TransactionIndex      uint64       `json:"transactionIndex"`
+	Confirmations         uint64       `json:"confirmations"`
+	RequiredConfirmations uint64       `json:"requiredConfirmations"`
+	Reason                string       `json:"reason"`
 }
 
 func SerializeHeader(header BlockHeader) []byte {
