@@ -13,6 +13,7 @@ const (
 	trustFile   = "trust-root.json"
 	headersFile = "header-chain.json"
 	resultsFile = "verification-results.json"
+	tasksFile   = "collection-tasks.json"
 )
 
 type FileStore struct {
@@ -31,6 +32,10 @@ type headerStore struct {
 
 type resultStore struct {
 	Results []VerificationResult `json:"results"`
+}
+
+type taskStore struct {
+	Tasks []CollectionTask `json:"tasks"`
 }
 
 func NewFileStore(dir string) *FileStore {
@@ -146,6 +151,61 @@ func (s *FileStore) LoadResults() ([]VerificationResult, error) {
 		return nil, err
 	}
 	return stored.Results, nil
+}
+
+// SaveTask persists a collection task next to the trust root it is bound
+// to. Reopening a task never extends trust: the task only records evidence
+// already checked against the stored trust root.
+func (s *FileStore) SaveTask(task *CollectionTask) error {
+	if task == nil {
+		return errors.New("task is nil")
+	}
+	anchor, err := s.LoadTrustRoot()
+	if err != nil {
+		return err
+	}
+	if task.TrustRootHash != anchor.BlockHash {
+		return errors.New("task is not bound to the stored trust root")
+	}
+	path := filepath.Join(s.dir, tasksFile)
+	var stored taskStore
+	if err := readJSON(path, &stored); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	for i, existing := range stored.Tasks {
+		if existing.ID == task.ID {
+			stored.Tasks[i] = *task
+			return writeJSON(path, stored)
+		}
+	}
+	stored.Tasks = append(stored.Tasks, *task)
+	return writeJSON(path, stored)
+}
+
+// LoadTask reopens a saved task. The task must still be bound to the
+// current immutable trust root; evidence is re-evaluated by the caller
+// against the rebuilt chain, never trusted from the file alone.
+func (s *FileStore) LoadTask(id string) (*CollectionTask, error) {
+	anchor, err := s.LoadTrustRoot()
+	if err != nil {
+		return nil, err
+	}
+	var stored taskStore
+	if err := readJSON(filepath.Join(s.dir, tasksFile), &stored); err != nil {
+		return nil, err
+	}
+	for _, task := range stored.Tasks {
+		if task.ID == id {
+			if task.TrustRootHash != anchor.BlockHash {
+				return nil, ErrTaskTrustRootMismatch
+			}
+			if task.Evidence == nil {
+				task.Evidence = map[string]*CollectedEvidence{}
+			}
+			return &task, nil
+		}
+	}
+	return nil, fmt.Errorf("collection task %q not found", id)
 }
 
 func sameTrustRoot(left, right TrustRoot) bool {
