@@ -10,9 +10,10 @@ import (
 )
 
 const (
-	trustFile   = "trust-root.json"
-	headersFile = "header-chain.json"
-	resultsFile = "verification-results.json"
+	trustFile      = "trust-root.json"
+	headersFile    = "header-chain.json"
+	resultsFile    = "verification-results.json"
+	collectionFile = "proof-collection-tasks.json"
 )
 
 type FileStore struct {
@@ -31,6 +32,10 @@ type headerStore struct {
 
 type resultStore struct {
 	Results []VerificationResult `json:"results"`
+}
+
+type collectionTaskStore struct {
+	Tasks []ProofCollectionTask `json:"tasks"`
 }
 
 func NewFileStore(dir string) *FileStore {
@@ -146,6 +151,66 @@ func (s *FileStore) LoadResults() ([]VerificationResult, error) {
 		return nil, err
 	}
 	return stored.Results, nil
+}
+
+func (s *FileStore) SaveProofCollectionTask(chain *Chain, task *ProofCollectionTask) error {
+	if chain == nil {
+		return errors.New("chain is nil")
+	}
+	if task == nil {
+		return errors.New("collection task is nil")
+	}
+	if chain.anchor.BlockHash != task.TrustRootHash {
+		return errors.New("collection task is not bound to the stored trust root")
+	}
+	recomputed, err := NewProofCollectionTask(chain, task.Name, task.Requirements, task.DefaultConfirmations)
+	if err != nil {
+		return err
+	}
+	if recomputed.ID != task.ID || recomputed.TrustRootHash != task.TrustRootHash {
+		return errors.New("collection task requirements or trusted basis was modified")
+	}
+	path := filepath.Join(s.dir, collectionFile)
+	var stored collectionTaskStore
+	if err := readJSON(path, &stored); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	for i := range stored.Tasks {
+		if stored.Tasks[i].ID == task.ID {
+			stored.Tasks[i] = *task
+			return writeJSON(path, stored)
+		}
+	}
+	stored.Tasks = append(stored.Tasks, *task)
+	return writeJSON(path, stored)
+}
+
+func (s *FileStore) LoadProofCollectionTask(chain *Chain, taskID Hash) (*ProofCollectionTask, error) {
+	if chain == nil {
+		return nil, errors.New("chain is nil")
+	}
+	var stored collectionTaskStore
+	if err := readJSON(filepath.Join(s.dir, collectionFile), &stored); err != nil {
+		return nil, err
+	}
+	for _, task := range stored.Tasks {
+		if task.ID != taskID {
+			continue
+		}
+		if task.TrustRootHash != chain.anchor.BlockHash {
+			return nil, errors.New("collection task is bound to a different trust root")
+		}
+		recomputed, err := NewProofCollectionTask(chain, task.Name, task.Requirements, task.DefaultConfirmations)
+		if err != nil {
+			return nil, err
+		}
+		if recomputed.ID != task.ID {
+			return nil, errors.New("stored collection task requirements or trusted basis was modified")
+		}
+		loaded := task
+		return &loaded, nil
+	}
+	return nil, os.ErrNotExist
 }
 
 func sameTrustRoot(left, right TrustRoot) bool {
