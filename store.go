@@ -202,6 +202,22 @@ func (s *FileStore) LoadTask(id string) (*CollectionTask, error) {
 			if task.Evidence == nil {
 				task.Evidence = map[string]*CollectedEvidence{}
 			}
+			for _, evidence := range task.Evidence {
+				if evidence.CurrentResult == (VerificationResult{}) {
+					evidence.CurrentResult = evidence.Result
+				}
+				for i := range evidence.Conflicts {
+					if evidence.Conflicts[i].CurrentResult == (VerificationResult{}) {
+						evidence.Conflicts[i].CurrentResult = evidence.Conflicts[i].Result
+					}
+					if evidence.Conflicts[i].State == "" {
+						evidence.Conflicts[i].State = EvidenceAccepted
+					}
+				}
+				if len(evidence.Conflicts) > 0 && evidence.ConflictState == "" {
+					evidence.ConflictState = ConflictUnresolved
+				}
+			}
 			return &task, nil
 		}
 	}

@@ -85,17 +85,189 @@ func TestCollectionTaskOutOfOrderBatchesDuplicatesAndConflicts(t *testing.T) {
 		t.Fatalf("unrequested material leaked into the task: %+v", batch.Items[0])
 	}
 
-	// Final missing piece completes the task exactly once.
+	// The final missing piece does not resolve the independently recorded contradiction.
 	proofA := NewInclusionProofForHeader(blockA.Header, blockA.Transactions, 0)
 	if _, err := task.SubmitBatch(chain, "relay-north", []InclusionProof{proofA}); err != nil {
 		t.Fatal(err)
 	}
-	if !task.Complete() || task.Status() != TaskComplete {
-		t.Fatalf("full evidence did not complete the task: %s", task.Explain())
+	if task.Complete() || task.Status() != TaskCollecting {
+		t.Fatalf("unresolved contradiction counted as a complete pass: %s", task.Explain())
 	}
 	last := task.Decisions[len(task.Decisions)-1]
-	if !last.Complete || len(last.Missing) != 0 {
-		t.Fatalf("final decision is not a complete pass: %+v", last)
+	if last.Complete || len(last.Missing) != 1 || last.Missing[0] != "need-b" {
+		t.Fatalf("final decision ignored the conflict: %+v", last)
+	}
+}
+
+func TestCollectionTaskConflictSurvivesRestartRecheckAndAbandon(t *testing.T) {
+	dir := t.TempDir()
+	store := NewFileStore(dir)
+	chain, anchor, blocks := buildLinearChain(t, 1)
+	blockA := mineBlockWith(t, chain, blocks[1].Header, 7001, [][]byte{[]byte("tx-a")})
+	blockB := mineBlockWith(t, chain, blockA.Header, 7002, [][]byte{[]byte("tx-b")})
+
+	task, err := NewCollectionTask("audit-conflict", []EvidenceRequirement{
+		{ID: "need-a", TransactionHash: TransactionHash([]byte("tx-a"))},
+		{ID: "need-b", TransactionHash: TransactionHash([]byte("tx-b"))},
+	}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	proofB := NewInclusionProofForHeader(blockB.Header, blockB.Transactions, 0)
+	if _, err := task.SubmitBatch(chain, "source-b-first", []InclusionProof{proofB}); err != nil {
+		t.Fatal(err)
+	}
+	proofA := NewInclusionProofForHeader(blockA.Header, blockA.Transactions, 0)
+	if _, err := task.SubmitBatch(chain, "source-a", []InclusionProof{proofA}); err != nil {
+		t.Fatal(err)
+	}
+
+	otherB := mineBlockWith(t, chain, blockA.Header, 8001, [][]byte{[]byte("tx-b")})
+	mineBlockWith(t, chain, otherB.Header, 8002, [][]byte{[]byte("fork-filler")})
+	conflictProof := NewInclusionProofForHeader(otherB.Header, otherB.Transactions, 0)
+	conflictBatch, err := task.SubmitBatch(chain, "source-b-other-block", []InclusionProof{conflictProof})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if conflictBatch.Items[0].Outcome != ItemConflict {
+		t.Fatalf("alternative proof was not recorded as a conflict: %+v", conflictBatch.Items[0])
+	}
+	if task.Complete() {
+		t.Fatalf("task passed with an unhandled conflict: %s", task.Explain())
+	}
+	missing := task.Missing()
+	if len(missing) != 1 || missing[0].ID != "need-b" {
+		t.Fatalf("conflicting requirement missing from overall scope: %+v", missing)
+	}
+	beforeReorg := len(task.Decisions)
+	oldDecision := task.Decisions[beforeReorg-1]
+
+	if err := store.SaveTrustRoot(anchor); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveChain(chain); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveTask(task); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := store.LoadTask("audit-conflict")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rebuilt, err := store.LoadChain(TeachingProofOfWork{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	kept := reopened.Evidence["need-b"]
+	if kept.Source != "source-b-first" || kept.Batch != 1 || len(kept.Conflicts) != 1 {
+		t.Fatalf("original provenance or conflict lost on reopen: %+v", kept)
+	}
+	if kept.Conflicts[0].Source != "source-b-other-block" || kept.Conflicts[0].Result.BlockHash != BlockHeaderHash(otherB.Header) {
+		t.Fatalf("conflicting source lost on reopen: %+v", kept.Conflicts[0])
+	}
+	if reopened.Complete() {
+		t.Fatalf("reopened task passed with an unhandled conflict: %s", reopened.Explain())
+	}
+
+	mineBlockWith(t, rebuilt, otherB.Header, 8003, [][]byte{[]byte("later-fork-tx")})
+	stale, err := reopened.Revalidate(rebuilt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stale) != 1 || stale[0] != "need-b" {
+		t.Fatalf("revalidation did not keep the conflict in scope: %v", stale)
+	}
+	if !decisionEqual(reopened.Decisions[beforeReorg-1], oldDecision) {
+		t.Fatal("revalidation rewrote the old decision basis")
+	}
+	newDecision := reopened.Decisions[len(reopened.Decisions)-1]
+	if newDecision.Complete || len(newDecision.Missing) != 1 || newDecision.CanonicalTip == oldDecision.CanonicalTip {
+		t.Fatalf("new decision did not reflect the current chain and conflict: %+v", newDecision)
+	}
+	if !strings.Contains(newDecision.Reason, "invalid primary proof") ||
+		!strings.Contains(newDecision.Reason, "source-b-first") ||
+		!strings.Contains(newDecision.Reason, "unresolved conflicts: need-b") {
+		t.Fatalf("new decision does not identify the failed proof and remaining contradiction: %s", newDecision.Reason)
+	}
+	if kept.State != EvidenceNeedsRecheck || !strings.Contains(kept.RecheckReason, "left the canonical chain") {
+		t.Fatalf("primary proof was not marked invalid: %+v", kept)
+	}
+	if kept.Conflicts[0].State != EvidenceAccepted || kept.ConflictState != ConflictUnresolved {
+		t.Fatalf("valid alternative proof was not left for explicit handling: %+v", kept)
+	}
+
+	reopened.Abandon("cannot choose between contradictory sources without reviewer instruction")
+	explanation := reopened.Explain()
+	if !strings.Contains(explanation, "source-b-first") ||
+		!strings.Contains(explanation, "source-b-other-block") ||
+		!strings.Contains(explanation, "needs-recheck") ||
+		!strings.Contains(explanation, "unresolved") ||
+		!strings.Contains(explanation, "cannot choose between contradictory sources") {
+		t.Fatalf("abandonment lost evidence or the concrete unfinished reason:\n%s", explanation)
+	}
+}
+
+func TestCollectionTaskLoadsLegacyUnresolvedConflict(t *testing.T) {
+	dir := t.TempDir()
+	store := NewFileStore(dir)
+	_, anchor, _ := buildLinearChain(t, 1)
+	txHash := TransactionHash([]byte("legacy-tx"))
+	firstHash := Hash{1}
+	otherHash := Hash{2}
+	task := CollectionTask{
+		ID:                    "legacy-conflict",
+		TrustRootHash:         anchor.BlockHash,
+		RequiredConfirmations: 1,
+		Requirements:          []EvidenceRequirement{{ID: "need-legacy", TransactionHash: txHash}},
+		Evidence: map[string]*CollectedEvidence{
+			"need-legacy": {
+				RequirementID: "need-legacy",
+				Source:        "legacy-source",
+				Batch:         1,
+				Result: VerificationResult{
+					Status:          ResultAccepted,
+					BlockHash:       firstHash,
+					TransactionHash: txHash,
+				},
+				State: EvidenceAccepted,
+				Conflicts: []ConflictingEvidence{
+					{
+						Source: "legacy-other-source",
+						Batch:  2,
+						Result: VerificationResult{
+							Status:          ResultAccepted,
+							BlockHash:       otherHash,
+							TransactionHash: txHash,
+						},
+					},
+				},
+			},
+		},
+	}
+	if err := store.SaveTrustRoot(anchor); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveTask(&task); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := store.LoadTask("legacy-conflict")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reopened.Complete() {
+		t.Fatal("legacy conflict was silently treated as resolved")
+	}
+	missing := reopened.Missing()
+	if len(missing) != 1 || missing[0].ID != "need-legacy" {
+		t.Fatalf("legacy conflict missing from reopened scope: %+v", missing)
+	}
+	legacy := reopened.Evidence["need-legacy"]
+	if legacy.ConflictState != ConflictUnresolved || legacy.Conflicts[0].State != EvidenceAccepted {
+		t.Fatalf("legacy conflict state not migrated: %+v", legacy)
 	}
 }
 
@@ -244,7 +416,7 @@ func TestCollectionTaskSaveReopenAndAbandon(t *testing.T) {
 	if !strings.Contains(explanation, "have: accepted") ||
 		!strings.Contains(explanation, "want: missing") ||
 		!strings.Contains(explanation, "requester cancelled the audit") ||
-		!strings.Contains(explanation, "incomplete: still missing want") {
+		!strings.Contains(explanation, "incomplete: still missing or unresolved: want") {
 		t.Fatalf("abandoned task cannot explain itself:\n%s", explanation)
 	}
 	if reopened.Status() != TaskAbandoned {
