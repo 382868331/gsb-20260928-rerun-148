@@ -25,12 +25,17 @@ const (
 
 // ConflictingEvidence records material that arrived later for a requirement
 // that is already satisfied. It never replaces the first accepted evidence;
-// it is kept so the contradiction stays explainable.
+// it is kept so the contradiction stays explainable. A conflict stays
+// unresolved until Revalidate finds the contradictory proof no longer holds
+// or ResolveConflict settles it explicitly; unresolved conflicts keep the
+// requirement out of the satisfied set.
 type ConflictingEvidence struct {
-	Source string             `json:"source"`
-	Batch  int                `json:"batch"`
-	Result VerificationResult `json:"result"`
-	Reason string             `json:"reason"`
+	Source     string             `json:"source"`
+	Batch      int                `json:"batch"`
+	Result     VerificationResult `json:"result"`
+	Reason     string             `json:"reason"`
+	Resolved   bool               `json:"resolved"`
+	Resolution string             `json:"resolution,omitempty"`
 }
 
 // CollectedEvidence is the first accepted proof for a requirement together
@@ -85,6 +90,7 @@ type TaskDecision struct {
 	RequiredConfirmations uint64    `json:"requiredConfirmations"`
 	Complete              bool      `json:"complete"`
 	Missing               []string  `json:"missing"`
+	Conflicts             []string  `json:"conflicts,omitempty"`
 	Reason                string    `json:"reason"`
 }
 
@@ -252,14 +258,47 @@ func sameEvidence(a, b VerificationResult) bool {
 		a.TransactionHash == b.TransactionHash
 }
 
+// PendingConflicts returns the requirements whose collected evidence still
+// carries a contradiction nobody has settled. An unresolved conflict means
+// the requirement is not clearly satisfied, so it cannot count toward a
+// complete pass.
+func (t *CollectionTask) PendingConflicts() []string {
+	var ids []string
+	for _, requirement := range t.Requirements {
+		evidence, ok := t.Evidence[requirement.ID]
+		if !ok {
+			continue
+		}
+		for _, conflict := range evidence.Conflicts {
+			if !conflict.Resolved {
+				ids = append(ids, requirement.ID)
+				break
+			}
+		}
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+func hasPendingConflict(evidence *CollectedEvidence) bool {
+	for _, conflict := range evidence.Conflicts {
+		if !conflict.Resolved {
+			return true
+		}
+	}
+	return false
+}
+
 // Missing returns the requirements that do not currently hold accepted,
-// still-valid evidence. The scope is exact: partial validity never counts
-// as overall completeness.
+// still-valid and undisputed evidence. The scope is exact: partial validity
+// never counts as overall completeness, and a requirement with an
+// unresolved conflict is reported here instead of being silently treated
+// as satisfied.
 func (t *CollectionTask) Missing() []EvidenceRequirement {
 	var missing []EvidenceRequirement
 	for _, requirement := range t.Requirements {
 		evidence, ok := t.Evidence[requirement.ID]
-		if !ok || evidence.State != EvidenceAccepted {
+		if !ok || evidence.State != EvidenceAccepted || hasPendingConflict(evidence) {
 			missing = append(missing, requirement)
 		}
 	}
@@ -288,6 +327,7 @@ func (t *CollectionTask) recordDecision(chain *Chain, reason string) {
 		missingIDs = append(missingIDs, requirement.ID)
 	}
 	sort.Strings(missingIDs)
+	conflicts := t.PendingConflicts()
 	complete := len(missing) == 0 && !t.Abandoned
 	decision := TaskDecision{
 		Version:               len(t.Decisions) + 1,
@@ -296,12 +336,47 @@ func (t *CollectionTask) recordDecision(chain *Chain, reason string) {
 		RequiredConfirmations: t.RequiredConfirmations,
 		Complete:              complete,
 		Missing:               missingIDs,
+		Conflicts:             conflicts,
 		Reason:                reason,
 	}
 	if complete {
 		decision.Reason = reason + ": all requirements satisfied"
+	} else if len(conflicts) > 0 {
+		decision.Reason = reason + ": unresolved conflicts on " + strings.Join(conflicts, ", ")
 	}
 	t.Decisions = append(t.Decisions, decision)
+}
+
+// ResolveConflict explicitly settles every pending contradiction for one
+// requirement, keeping the first accepted evidence. The resolution note is
+// stored on each settled conflict and the settlement becomes its own
+// decision version, so the task can only pass once every contradiction has
+// been dealt with openly.
+func (t *CollectionTask) ResolveConflict(chain *Chain, requirementID string, resolution string) error {
+	if t.Abandoned {
+		return ErrTaskAbandoned
+	}
+	if err := t.checkTrustRoot(chain); err != nil {
+		return err
+	}
+	evidence, ok := t.Evidence[requirementID]
+	if !ok {
+		return fmt.Errorf("no evidence collected for requirement %s", requirementID)
+	}
+	pending := false
+	for i := range evidence.Conflicts {
+		if evidence.Conflicts[i].Resolved {
+			continue
+		}
+		evidence.Conflicts[i].Resolved = true
+		evidence.Conflicts[i].Resolution = resolution
+		pending = true
+	}
+	if !pending {
+		return fmt.Errorf("requirement %s has no unresolved conflict", requirementID)
+	}
+	t.recordDecision(chain, fmt.Sprintf("conflicts resolved for %s: %s", requirementID, resolution))
+	return nil
 }
 
 // Revalidate re-checks every accepted evidence item against the current
@@ -329,6 +404,22 @@ func (t *CollectionTask) Revalidate(chain *Chain) ([]string, error) {
 		}
 	}
 	sort.Strings(stale)
+	for _, requirement := range t.Requirements {
+		evidence, ok := t.Evidence[requirement.ID]
+		if !ok {
+			continue
+		}
+		for i := range evidence.Conflicts {
+			conflict := &evidence.Conflicts[i]
+			if conflict.Resolved {
+				continue
+			}
+			if _, err := chain.RecheckResult(conflict.Result, t.RequiredConfirmations); err != nil {
+				conflict.Resolved = true
+				conflict.Resolution = "conflicting proof no longer holds on the current chain: " + err.Error()
+			}
+		}
+	}
 	if len(stale) > 0 {
 		t.recordDecision(chain, fmt.Sprintf("revalidation invalidated: %s", strings.Join(stale, ", ")))
 	} else {
@@ -361,7 +452,17 @@ func (t *CollectionTask) Explain() string {
 			line += " recheck-reason: " + evidence.RecheckReason
 		}
 		if len(evidence.Conflicts) > 0 {
-			line += fmt.Sprintf(" (%d conflicting later arrival(s) recorded, first kept)", len(evidence.Conflicts))
+			pending := 0
+			for _, conflict := range evidence.Conflicts {
+				if !conflict.Resolved {
+					pending++
+				}
+			}
+			if pending > 0 {
+				line += fmt.Sprintf(" (%d unresolved conflicting arrival(s), requirement not settled)", pending)
+			} else {
+				line += fmt.Sprintf(" (%d conflicting later arrival(s) recorded, first kept)", len(evidence.Conflicts))
+			}
 		}
 		lines = append(lines, line)
 	}
@@ -376,6 +477,9 @@ func (t *CollectionTask) Explain() string {
 		}
 		sort.Strings(ids)
 		lines = append(lines, "  incomplete: still missing "+strings.Join(ids, ", "))
+		if conflicts := t.PendingConflicts(); len(conflicts) > 0 {
+			lines = append(lines, "  incomplete: unresolved conflicts on "+strings.Join(conflicts, ", "))
+		}
 	}
 	return strings.Join(lines, "\n")
 }

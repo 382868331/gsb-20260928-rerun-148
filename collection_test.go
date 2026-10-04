@@ -74,6 +74,9 @@ func TestCollectionTaskOutOfOrderBatchesDuplicatesAndConflicts(t *testing.T) {
 	if kept.Result.BlockHash != BlockHeaderHash(blockB.Header) || len(kept.Conflicts) != 1 {
 		t.Fatalf("last arrival overrode the first evidence: %+v", kept)
 	}
+	if pending := task.PendingConflicts(); len(pending) != 1 || pending[0] != "need-b" {
+		t.Fatalf("recorded conflict did not enter the overall judgment: %v", pending)
+	}
 
 	// Unrequested material is logged but never fills the requirement set.
 	stray := InclusionProof{Transaction: []byte("tx-stray"), BlockHash: BlockHeaderHash(blockB.Header)}
@@ -88,6 +91,17 @@ func TestCollectionTaskOutOfOrderBatchesDuplicatesAndConflicts(t *testing.T) {
 	// Final missing piece completes the task exactly once.
 	proofA := NewInclusionProofForHeader(blockA.Header, blockA.Transactions, 0)
 	if _, err := task.SubmitBatch(chain, "relay-north", []InclusionProof{proofA}); err != nil {
+		t.Fatal(err)
+	}
+	if task.Complete() {
+		t.Fatal("unresolved conflict counted as a complete pass")
+	}
+	if missing := task.Missing(); len(missing) != 1 || missing[0].ID != "need-b" {
+		t.Fatalf("conflicted requirement reported as satisfied: %+v", missing)
+	}
+
+	// The contradiction must be settled explicitly before the task passes.
+	if err := task.ResolveConflict(chain, "need-b", "auditor confirmed the first arrival; later fork block carries the same transaction"); err != nil {
 		t.Fatal(err)
 	}
 	if !task.Complete() || task.Status() != TaskComplete {
@@ -246,6 +260,143 @@ func TestCollectionTaskSaveReopenAndAbandon(t *testing.T) {
 		!strings.Contains(explanation, "requester cancelled the audit") ||
 		!strings.Contains(explanation, "incomplete: still missing want") {
 		t.Fatalf("abandoned task cannot explain itself:\n%s", explanation)
+	}
+	if reopened.Status() != TaskAbandoned {
+		t.Fatal("abandoned task reports the wrong status")
+	}
+}
+
+func TestCollectionTaskConflictBlocksCompletionAcrossReopenAndReorg(t *testing.T) {
+	dir := t.TempDir()
+	store := NewFileStore(dir)
+	chain, anchor, blocks := buildLinearChain(t, 2)
+	blockA := mineBlockWith(t, chain, blocks[2].Header, 2001, [][]byte{[]byte("tx-a")})
+	blockB := mineBlockWith(t, chain, blockA.Header, 2002, [][]byte{[]byte("tx-b")})
+
+	task, err := NewCollectionTask("audit-conflict", []EvidenceRequirement{
+		{ID: "need-a", TransactionHash: TransactionHash([]byte("tx-a"))},
+		{ID: "need-b", TransactionHash: TransactionHash([]byte("tx-b"))},
+	}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Out-of-order arrival fills both requirements.
+	proofB := NewInclusionProofForHeader(blockB.Header, blockB.Transactions, 0)
+	proofA := NewInclusionProofForHeader(blockA.Header, blockA.Transactions, 0)
+	if _, err := task.SubmitBatch(chain, "relay-1", []InclusionProof{proofB}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := task.SubmitBatch(chain, "relay-1", []InclusionProof{proofA}); err != nil {
+		t.Fatal(err)
+	}
+	if !task.Complete() {
+		t.Fatal("both requirements were satisfied before the contradiction arrived")
+	}
+
+	// The same transaction is proved in a different block on a heavier fork.
+	blockC := mineBlockWith(t, chain, blockA.Header, 2003, [][]byte{[]byte("tx-b")})
+	mineBlockWith(t, chain, blockC.Header, 2004, [][]byte{[]byte("filler")})
+	conflicting := NewInclusionProofForHeader(blockC.Header, blockC.Transactions, 0)
+	batch, err := task.SubmitBatch(chain, "relay-2", []InclusionProof{conflicting})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if batch.Items[0].Outcome != ItemConflict {
+		t.Fatalf("second location for the same transaction not flagged: %+v", batch.Items[0])
+	}
+	if task.Complete() {
+		t.Fatal("task admits a contradiction and still reports a complete pass")
+	}
+	if missing := task.Missing(); len(missing) != 1 || missing[0].ID != "need-b" {
+		t.Fatalf("conflicted requirement missing from the open scope: %+v", missing)
+	}
+
+	// Save and reopen: both sources, the conflict scope and the overall
+	// status must survive the round trip.
+	if err := store.SaveTrustRoot(anchor); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveChain(chain); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveTask(task); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := store.LoadTask("audit-conflict")
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence := reopened.Evidence["need-b"]
+	if evidence.Source != "relay-1" || len(evidence.Conflicts) != 1 || evidence.Conflicts[0].Source != "relay-2" {
+		t.Fatalf("reopen lost one of the two sources: %+v", evidence)
+	}
+	if pending := reopened.PendingConflicts(); len(pending) != 1 || pending[0] != "need-b" {
+		t.Fatalf("reopen lost the conflict scope: %v", pending)
+	}
+	if reopened.Complete() || reopened.Status() != TaskCollecting {
+		t.Fatalf("reopened task reports the wrong overall status: %s", reopened.Explain())
+	}
+
+	// Switch the canonical chain to a fork that keeps the conflicting block
+	// but drops the first evidence block.
+	blockE := mineBlockWith(t, chain, blockC.Header, 2005, [][]byte{[]byte("fork-tx")})
+	e2 := mineBlockWith(t, chain, blockE.Header, 2006, [][]byte{[]byte("fork-tx")})
+	mineBlockWith(t, chain, e2.Header, 2007, [][]byte{[]byte("fork-tx")})
+	if err := store.SaveChain(chain); err != nil {
+		t.Fatal(err)
+	}
+	rebuilt, err := store.LoadChain(TeachingProofOfWork{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rebuilt.CanonicalTip() != chain.CanonicalTip() {
+		t.Fatal("rebuilt chain disagrees on the canonical tip")
+	}
+
+	before := len(reopened.Decisions)
+	oldDecision := reopened.Decisions[before-1]
+	stale, err := reopened.Revalidate(rebuilt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stale) != 1 || stale[0] != "need-b" {
+		t.Fatalf("reorg did not invalidate exactly the first evidence: %v", stale)
+	}
+	if !decisionEqual(reopened.Decisions[before-1], oldDecision) {
+		t.Fatal("revalidation rewrote an old decision basis")
+	}
+	latest := reopened.Decisions[len(reopened.Decisions)-1]
+	if latest.Complete || latest.CanonicalTip == oldDecision.CanonicalTip {
+		t.Fatalf("new decision did not record the new basis: %+v", latest)
+	}
+	if len(latest.Conflicts) != 1 || latest.Conflicts[0] != "need-b" {
+		t.Fatalf("new decision does not explain the pending conflict: %+v", latest)
+	}
+	if pending := reopened.PendingConflicts(); len(pending) != 1 || pending[0] != "need-b" {
+		t.Fatalf("still-valid conflicting proof was silently dropped: %v", pending)
+	}
+	if reopened.Complete() {
+		t.Fatal("invalidated and contradicted evidence still counts as a pass")
+	}
+
+	// Abandoning keeps the checked evidence and the exact open reasons.
+	reopened.Abandon("requester cancelled before the contradiction was settled")
+	if _, err := reopened.SubmitBatch(rebuilt, "late", nil); !errors.Is(err, ErrTaskAbandoned) {
+		t.Fatalf("abandoned task accepted new material: %v", err)
+	}
+	explanation := reopened.Explain()
+	for _, want := range []string{
+		"need-a: accepted",
+		"need-b: needs-recheck",
+		"unresolved conflicting arrival",
+		"requester cancelled before the contradiction was settled",
+		"incomplete: still missing need-b",
+		"unresolved conflicts on need-b",
+	} {
+		if !strings.Contains(explanation, want) {
+			t.Fatalf("abandoned task explanation misses %q:%s%s", want, "\n", explanation)
+		}
 	}
 	if reopened.Status() != TaskAbandoned {
 		t.Fatal("abandoned task reports the wrong status")
