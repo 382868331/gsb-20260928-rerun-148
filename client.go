@@ -220,6 +220,24 @@ func (c *Chain) IsCanonical(hash Hash) bool {
 	return hash == c.anchor.BlockHash
 }
 
+// CanonicalChain returns the complete current canonical chain from the
+// immutable trust root to the selected tip. Review snapshots use it rather
+// than trusting a tip hash alone.
+func (c *Chain) CanonicalChain() []Hash {
+	var reversed []Hash
+	for hash := c.canonicalTip; ; hash = c.parentByChild[hash] {
+		reversed = append(reversed, hash)
+		if hash == c.anchor.BlockHash {
+			break
+		}
+	}
+	chain := make([]Hash, len(reversed))
+	for i, hash := range reversed {
+		chain[len(reversed)-1-i] = hash
+	}
+	return chain
+}
+
 func (c *Chain) Confirmations(hash Hash) (uint64, error) {
 	if !c.IsCanonical(hash) {
 		return 0, ErrNotCanonical

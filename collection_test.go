@@ -436,6 +436,182 @@ func TestCollectionTaskRejectsInvalidDefinition(t *testing.T) {
 	}
 }
 
+func TestCollectionReviewRoundsKeepBasisAndTrackChangedMaterials(t *testing.T) {
+	dir := t.TempDir()
+	store := NewFileStore(dir)
+	chain, anchor, blocks := buildLinearChain(t, 1)
+	blockA := mineBlockWith(t, chain, blocks[1].Header, 7101, [][]byte{[]byte("review-a")})
+	blockB := mineBlockWith(t, chain, blockA.Header, 7102, [][]byte{[]byte("review-b")})
+
+	task, err := NewCollectionTask("review-audit", []EvidenceRequirement{
+		{ID: "need-a", TransactionHash: TransactionHash([]byte("review-a"))},
+		{ID: "need-b", TransactionHash: TransactionHash([]byte("review-b"))},
+	}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proofA := NewInclusionProofForHeader(blockA.Header, blockA.Transactions, 0)
+	proofB := NewInclusionProofForHeader(blockB.Header, blockB.Transactions, 0)
+	if _, err := task.SubmitBatch(chain, "source-main", []InclusionProof{proofA, proofB}); err != nil {
+		t.Fatal(err)
+	}
+
+	round, err := task.OpenReviewRound(chain, "reviewer-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if round.Number != 1 || round.State != ReviewOpen || round.BatchCount != 1 || len(round.Materials) != 2 {
+		t.Fatalf("review basis not frozen: %+v", round)
+	}
+	if len(round.Basis.CanonicalChain) != int(chain.CanonicalTip().Height)+1 {
+		t.Fatalf("full canonical chain not recorded: %+v", round.Basis)
+	}
+	if round.Basis.TrustRootHash != anchor.BlockHash || round.Basis.RequiredConfirmations != 1 {
+		t.Fatalf("review basis misses trust root or policy: %+v", round.Basis)
+	}
+	if _, err := task.RecordReviewOpinion(chain, 1, "need-a", ReviewPassed, "valid primary proof"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := task.RecordReviewOpinion(chain, 1, "need-b", ReviewReturned, "needs an additional source statement"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := task.CompleteReviewRound(chain, 1); err != nil {
+		t.Fatal(err)
+	}
+	assessment, err := task.AssessReviewRound(chain, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(assessment.MissingDecisions) != 0 {
+		t.Fatalf("completed round still reports missing item decisions: %+v", assessment.MissingDecisions)
+	}
+	for _, item := range assessment.Items {
+		if item.Applicability != ReviewStillApplicable {
+			t.Fatalf("fresh review was not applicable: %+v", item)
+		}
+	}
+
+	// A new contradictory proof changes only need-b's material version. The old
+	// pass for need-a remains applicable; the old need-b opinion cannot move.
+	otherB := mineBlockWith(t, chain, blockA.Header, 8101, [][]byte{[]byte("review-b")})
+	mineBlockWith(t, chain, otherB.Header, 8102, [][]byte{[]byte("fork-filler")})
+	conflictB := NewInclusionProofForHeader(otherB.Header, otherB.Transactions, 0)
+	if _, err := task.SubmitBatch(chain, "source-alt", []InclusionProof{conflictB}); err != nil {
+		t.Fatal(err)
+	}
+	assessment, err = task.AssessReviewRound(chain, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range assessment.Items {
+		want := ReviewStillApplicable
+		if item.RequirementID == "need-b" {
+			want = ReviewNeedsReview
+		}
+		if item.Applicability != want {
+			t.Fatalf("conflicting material was classified incorrectly: %+v", item)
+		}
+	}
+	if _, err := task.OpenReviewRound(chain, "reviewer-2"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := task.RecordReviewOpinion(chain, 2, "need-b", ReviewPassed, "must not pass conflict"); !errors.Is(err, ErrInvalidReviewOpinion) {
+		t.Fatalf("conflicting material could receive a pass: %v", err)
+	}
+	if _, err := task.RecordReviewOpinion(chain, 2, "need-b", ReviewReturned, "conflicting proofs must be resolved"); err != nil {
+		t.Fatal(err)
+	}
+	if err := task.AbandonReviewRound(2, "waiting for source clarification"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.SaveTrustRoot(anchor); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveChain(chain); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveTask(task); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := store.LoadTask("review-audit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rebuilt, err := store.LoadChain(TeachingProofOfWork{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reopened.ReviewRounds) != 2 {
+		t.Fatalf("review rounds were not persisted: %+v", reopened.ReviewRounds)
+	}
+	if reopened.ReviewRounds[0].Basis.CanonicalTip != task.ReviewRounds[0].Basis.CanonicalTip ||
+		reopened.ReviewRounds[1].AbandonReason != "waiting for source clarification" {
+		t.Fatalf("review basis or abandonment was lost: %+v", reopened.ReviewRounds)
+	}
+	assessment, err = reopened.AssessReviewRound(rebuilt, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if assessment.Items[0].Applicability != ReviewStillApplicable || assessment.Items[1].Applicability != ReviewNeedsReview {
+		t.Fatalf("reopened assessment did not preserve applicability: %+v", assessment.Items)
+	}
+	explanation := reopened.Explain()
+	if !strings.Contains(explanation, "review-round 1") ||
+		!strings.Contains(explanation, "review-round 2") ||
+		!strings.Contains(explanation, "source-alt") ||
+		!strings.Contains(explanation, "waiting for source clarification") {
+		t.Fatalf("abandoned review deleted audit material:\n%s", explanation)
+	}
+}
+
+func TestCollectionReviewRejectsStaleOpenRoundAfterChainChange(t *testing.T) {
+	chain, genesis, blocks := buildLinearChain(t, 3)
+	block := mineBlockWith(t, chain, blocks[3].Header, 7201, [][]byte{[]byte("watched-review-tx")})
+	mineBlockWith(t, chain, block.Header, 7202, [][]byte{[]byte("filler")})
+	task, err := NewCollectionTask("review-reorg", []EvidenceRequirement{
+		{ID: "need-watched", TransactionHash: TransactionHash([]byte("watched-review-tx"))},
+	}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof := NewInclusionProofForHeader(block.Header, block.Transactions, 0)
+	if _, err := task.SubmitBatch(chain, "source-1", []InclusionProof{proof}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := task.OpenReviewRound(chain, "reviewer-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	parent := genesis.Header
+	for i := 0; i < 7; i++ {
+		fork, err := MineChild(parent, uint64(7300+i), [][]byte{[]byte("fork-tx")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := chain.AddHeader(fork.Header); err != nil {
+			t.Fatal(err)
+		}
+		parent = fork.Header
+	}
+	if _, err := task.RecordReviewOpinion(chain, 1, "need-watched", ReviewPassed, "late pass"); !errors.Is(err, ErrReviewBasisChanged) {
+		t.Fatalf("stale open review accepted an opinion: %v", err)
+	}
+	if _, err := task.CompleteReviewRound(chain, 1); !errors.Is(err, ErrReviewBasisChanged) {
+		t.Fatalf("stale open review could be closed: %v", err)
+	}
+	if err := task.AbandonReviewRound(1, "canonical chain changed"); err != nil {
+		t.Fatal(err)
+	}
+	assessment, err := task.AssessReviewRound(chain, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(assessment.Items) != 1 || assessment.Items[0].Applicability != ReviewNeedsReview {
+		t.Fatalf("old opinion survived a conflicting canonical chain: %+v", assessment)
+	}
+}
+
 func decisionEqual(a, b TaskDecision) bool {
 	if a.Version != b.Version || a.CanonicalTip != b.CanonicalTip ||
 		a.RequiredConfirmations != b.RequiredConfirmations || a.Complete != b.Complete ||

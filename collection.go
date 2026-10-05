@@ -108,6 +108,90 @@ const (
 	TaskAbandoned  TaskStatus = "abandoned"
 )
 
+type ReviewState string
+
+const (
+	ReviewOpen      ReviewState = "open"
+	ReviewCompleted ReviewState = "completed"
+	ReviewAbandoned ReviewState = "abandoned"
+)
+
+type ReviewDecision string
+
+const (
+	ReviewPassed   ReviewDecision = "passed"
+	ReviewReturned ReviewDecision = "returned"
+)
+
+type ReviewApplicability string
+
+const (
+	ReviewStillApplicable ReviewApplicability = "applicable"
+	ReviewNeedsReview     ReviewApplicability = "needs-review"
+)
+
+// ReviewBasis freezes the normative chain used by one independent review
+// round. Old rounds keep this basis even after a later reorg.
+type ReviewBasis struct {
+	ObservedAt            time.Time `json:"observedAt"`
+	TrustRootHash         Hash      `json:"trustRootHash"`
+	CanonicalTip          Hash      `json:"canonicalTip"`
+	CanonicalChain        []Hash    `json:"canonicalChain"`
+	RequiredConfirmations uint64    `json:"requiredConfirmations"`
+	ConsensusRule         string    `json:"consensusRule"`
+}
+
+// ReviewMaterialVersion identifies one requirement's primary proof and all
+// contradictory proofs visible when the review round opened.
+type ReviewMaterialVersion struct {
+	RequirementID      string        `json:"requirementId"`
+	PrimaryResultID    Hash          `json:"primaryResultId,omitempty"`
+	PrimaryBlockHash   Hash          `json:"primaryBlockHash,omitempty"`
+	PrimaryState       EvidenceState `json:"primaryState,omitempty"`
+	ConflictResultIDs  []Hash        `json:"conflictResultIds,omitempty"`
+	UnresolvedConflict bool          `json:"unresolvedConflict"`
+}
+
+// ReviewOpinion is a reviewer's item-level decision. It never replaces or
+// mutates the submitted proof it refers to.
+type ReviewOpinion struct {
+	RequirementID    string         `json:"requirementId"`
+	Decision         ReviewDecision `json:"decision"`
+	Comment          string         `json:"comment"`
+	EvidenceResultID Hash           `json:"evidenceResultId,omitempty"`
+	RecordedAt       time.Time      `json:"recordedAt"`
+}
+
+// ReviewRound is an immutable review session. Abandoning it closes the
+// session without deleting batches, proofs, or opinions already recorded.
+type ReviewRound struct {
+	Number        int                     `json:"number"`
+	Reviewer      string                  `json:"reviewer"`
+	OpenedAt      time.Time               `json:"openedAt"`
+	CompletedAt   time.Time               `json:"completedAt,omitempty"`
+	State         ReviewState             `json:"state"`
+	AbandonReason string                  `json:"abandonReason,omitempty"`
+	Basis         ReviewBasis             `json:"basis"`
+	BatchCount    int                     `json:"batchCount"`
+	Materials     []ReviewMaterialVersion `json:"materials"`
+	Opinions      []ReviewOpinion         `json:"opinions,omitempty"`
+}
+
+type ReviewItemAssessment struct {
+	RequirementID string              `json:"requirementId"`
+	Decision      ReviewDecision      `json:"decision,omitempty"`
+	Applicability ReviewApplicability `json:"applicability"`
+	Reason        string              `json:"reason"`
+}
+
+type ReviewRoundAssessment struct {
+	Number           int                    `json:"number"`
+	State            ReviewState            `json:"state"`
+	CurrentTip       Hash                   `json:"currentTip"`
+	MissingDecisions []string               `json:"missingDecisions"`
+	Items            []ReviewItemAssessment `json:"items"`
+}
+
 // CollectionTask gathers a fixed set of proofs against a fixed trusted
 // basis. Material may arrive in any number of batches and any order.
 type CollectionTask struct {
@@ -119,6 +203,7 @@ type CollectionTask struct {
 	Batches               []EvidenceBatch               `json:"batches"`
 	Evidence              map[string]*CollectedEvidence `json:"evidence"`
 	Decisions             []TaskDecision                `json:"decisions"`
+	ReviewRounds          []ReviewRound                 `json:"reviewRounds,omitempty"`
 	Abandoned             bool                          `json:"abandoned"`
 	AbandonReason         string                        `json:"abandonReason,omitempty"`
 }
@@ -129,6 +214,10 @@ var (
 	ErrInvalidConfirmations  = errors.New("collection task needs at least one required confirmation")
 	ErrTaskAbandoned         = errors.New("collection task was abandoned")
 	ErrTaskTrustRootMismatch = errors.New("collection task is bound to a different trust root")
+	ErrReviewNotFound        = errors.New("review round not found")
+	ErrReviewClosed          = errors.New("review round is closed")
+	ErrReviewBasisChanged    = errors.New("review round basis or material version changed")
+	ErrInvalidReviewOpinion  = errors.New("invalid review opinion")
 )
 
 // NewCollectionTask fixes the required record set and the trusted basis for
@@ -412,6 +501,344 @@ func (t *CollectionTask) Revalidate(chain *Chain) ([]string, error) {
 	return stale, nil
 }
 
+// OpenReviewRound starts an independent review on a frozen normative basis
+// and material snapshot. The reviewer records opinions without changing the
+// proofs already received.
+func (t *CollectionTask) OpenReviewRound(chain *Chain, reviewer string) (ReviewRound, error) {
+	if t.Abandoned {
+		return ReviewRound{}, ErrTaskAbandoned
+	}
+	if reviewer == "" {
+		return ReviewRound{}, errors.New("review round needs a reviewer")
+	}
+	if err := t.checkTrustRoot(chain); err != nil {
+		return ReviewRound{}, err
+	}
+	if _, err := t.openReviewRound(); err != nil {
+		return ReviewRound{}, err
+	}
+	round := ReviewRound{
+		Number:     len(t.ReviewRounds) + 1,
+		Reviewer:   reviewer,
+		OpenedAt:   time.Now().UTC(),
+		State:      ReviewOpen,
+		BatchCount: len(t.Batches),
+		Basis:      currentReviewBasis(t, chain),
+		Materials:  t.reviewMaterialSnapshot(),
+	}
+	t.ReviewRounds = append(t.ReviewRounds, round)
+	return round, nil
+}
+
+func (t *CollectionTask) openReviewRound() (*ReviewRound, error) {
+	for i := range t.ReviewRounds {
+		if t.ReviewRounds[i].State == ReviewOpen {
+			return nil, fmt.Errorf("review round %d is still open", t.ReviewRounds[i].Number)
+		}
+	}
+	return nil, nil
+}
+
+func currentReviewBasis(t *CollectionTask, chain *Chain) ReviewBasis {
+	return ReviewBasis{
+		ObservedAt:            time.Now().UTC(),
+		TrustRootHash:         t.TrustRootHash,
+		CanonicalTip:          chain.CanonicalTip().Hash,
+		CanonicalChain:        chain.CanonicalChain(),
+		RequiredConfirmations: t.RequiredConfirmations,
+		ConsensusRule:         fmt.Sprintf("%T", chain.consensus),
+	}
+}
+
+func (t *CollectionTask) reviewMaterialSnapshot() []ReviewMaterialVersion {
+	materials := make([]ReviewMaterialVersion, 0, len(t.Requirements))
+	for _, requirement := range t.Requirements {
+		material := ReviewMaterialVersion{RequirementID: requirement.ID}
+		if evidence, ok := t.Evidence[requirement.ID]; ok {
+			material.PrimaryResultID = evidence.Result.ID
+			material.PrimaryBlockHash = evidence.Result.BlockHash
+			material.PrimaryState = evidence.State
+			material.UnresolvedConflict = t.conflictIsUnresolved(evidence)
+			for _, conflict := range evidence.Conflicts {
+				material.ConflictResultIDs = append(material.ConflictResultIDs, conflict.Result.ID)
+			}
+			sort.Slice(material.ConflictResultIDs, func(i, j int) bool {
+				return material.ConflictResultIDs[i].Hex() < material.ConflictResultIDs[j].Hex()
+			})
+		}
+		materials = append(materials, material)
+	}
+	return materials
+}
+
+func (t *CollectionTask) reviewRound(number int) (*ReviewRound, error) {
+	for i := range t.ReviewRounds {
+		if t.ReviewRounds[i].Number == number {
+			return &t.ReviewRounds[i], nil
+		}
+	}
+	return nil, fmt.Errorf("%w: %d", ErrReviewNotFound, number)
+}
+
+func reviewRequirement(round *ReviewRound, requirementID string) (*ReviewMaterialVersion, error) {
+	for i := range round.Materials {
+		if round.Materials[i].RequirementID == requirementID {
+			return &round.Materials[i], nil
+		}
+	}
+	return nil, fmt.Errorf("%w: requirement %s", ErrInvalidReviewOpinion, requirementID)
+}
+
+// RecordReviewOpinion appends one immutable item-level decision to an open
+// round. A changed chain or material version forces a fresh round instead of
+// allowing an old opinion to be moved onto different proof.
+func (t *CollectionTask) RecordReviewOpinion(chain *Chain, number int, requirementID string, decision ReviewDecision, comment string) (ReviewOpinion, error) {
+	if t.Abandoned {
+		return ReviewOpinion{}, ErrTaskAbandoned
+	}
+	if comment == "" {
+		return ReviewOpinion{}, fmt.Errorf("%w: comment is required", ErrInvalidReviewOpinion)
+	}
+	if decision != ReviewPassed && decision != ReviewReturned {
+		return ReviewOpinion{}, fmt.Errorf("%w: unknown decision %q", ErrInvalidReviewOpinion, decision)
+	}
+	if err := t.checkTrustRoot(chain); err != nil {
+		return ReviewOpinion{}, err
+	}
+	round, err := t.reviewRound(number)
+	if err != nil {
+		return ReviewOpinion{}, err
+	}
+	if round.State != ReviewOpen {
+		return ReviewOpinion{}, fmt.Errorf("%w: %d", ErrReviewClosed, number)
+	}
+	frozen, err := reviewRequirement(round, requirementID)
+	if err != nil {
+		return ReviewOpinion{}, err
+	}
+	if !t.reviewBasisMatches(round.Basis, chain) {
+		return ReviewOpinion{}, fmt.Errorf("%w: normative chain changed for round %d", ErrReviewBasisChanged, number)
+	}
+	if !t.reviewMaterialMatches(*frozen, requirementID) {
+		return ReviewOpinion{}, fmt.Errorf("%w: material changed for requirement %s", ErrReviewBasisChanged, requirementID)
+	}
+	if decision == ReviewPassed && !frozenProofMayPass(frozen) {
+		return ReviewOpinion{}, fmt.Errorf("%w: requirement %s has no accepted, unconflicted proof", ErrInvalidReviewOpinion, requirementID)
+	}
+	for _, opinion := range round.Opinions {
+		if opinion.RequirementID == requirementID {
+			return ReviewOpinion{}, fmt.Errorf("%w: requirement %s already has an opinion", ErrInvalidReviewOpinion, requirementID)
+		}
+	}
+	opinion := ReviewOpinion{
+		RequirementID:    requirementID,
+		Decision:         decision,
+		Comment:          comment,
+		EvidenceResultID: frozen.PrimaryResultID,
+		RecordedAt:       time.Now().UTC(),
+	}
+	round.Opinions = append(round.Opinions, opinion)
+	return opinion, nil
+}
+
+func frozenProofMayPass(material *ReviewMaterialVersion) bool {
+	return material.PrimaryResultID != (Hash{}) &&
+		material.PrimaryState == EvidenceAccepted &&
+		!material.UnresolvedConflict
+}
+
+func (t *CollectionTask) reviewBasisMatches(basis ReviewBasis, chain *Chain) bool {
+	current := currentReviewBasis(t, chain)
+	return basis.TrustRootHash == current.TrustRootHash &&
+		basis.CanonicalTip == current.CanonicalTip &&
+		hashSequenceEqual(basis.CanonicalChain, current.CanonicalChain) &&
+		basis.RequiredConfirmations == current.RequiredConfirmations &&
+		basis.ConsensusRule == current.ConsensusRule
+}
+
+func hashSequenceEqual(left, right []Hash) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (t *CollectionTask) reviewMaterialMatches(frozen ReviewMaterialVersion, requirementID string) bool {
+	for _, current := range t.reviewMaterialSnapshot() {
+		if current.RequirementID != requirementID {
+			continue
+		}
+		return current.PrimaryResultID == frozen.PrimaryResultID &&
+			current.PrimaryState == frozen.PrimaryState &&
+			current.UnresolvedConflict == frozen.UnresolvedConflict &&
+			hashSequenceEqual(current.ConflictResultIDs, frozen.ConflictResultIDs)
+	}
+	return false
+}
+
+// CompleteReviewRound closes a round once every fixed requirement has an
+// item-level opinion.
+func (t *CollectionTask) CompleteReviewRound(chain *Chain, number int) (ReviewRound, error) {
+	if t.Abandoned {
+		return ReviewRound{}, ErrTaskAbandoned
+	}
+	if err := t.checkTrustRoot(chain); err != nil {
+		return ReviewRound{}, err
+	}
+	round, err := t.reviewRound(number)
+	if err != nil {
+		return ReviewRound{}, err
+	}
+	if round.State != ReviewOpen {
+		return ReviewRound{}, fmt.Errorf("%w: %d", ErrReviewClosed, number)
+	}
+	if !t.reviewBasisMatches(round.Basis, chain) {
+		return ReviewRound{}, fmt.Errorf("%w: normative chain changed for round %d", ErrReviewBasisChanged, number)
+	}
+	for _, frozen := range round.Materials {
+		if !t.reviewMaterialMatches(frozen, frozen.RequirementID) {
+			return ReviewRound{}, fmt.Errorf("%w: material changed for requirement %s", ErrReviewBasisChanged, frozen.RequirementID)
+		}
+	}
+	if missing := t.missingReviewDecisions(round); len(missing) > 0 {
+		return ReviewRound{}, fmt.Errorf("%w: missing decisions: %s", ErrInvalidReviewOpinion, strings.Join(missing, ", "))
+	}
+	round.State = ReviewCompleted
+	round.CompletedAt = time.Now().UTC()
+	return *round, nil
+}
+
+// AbandonReviewRound closes an unfinished review while retaining its frozen
+// basis, material snapshot, opinions, and all original evidence.
+func (t *CollectionTask) AbandonReviewRound(number int, reason string) error {
+	if reason == "" {
+		return errors.New("abandoned review round needs a reason")
+	}
+	round, err := t.reviewRound(number)
+	if err != nil {
+		return err
+	}
+	if round.State != ReviewOpen {
+		return fmt.Errorf("%w: %d", ErrReviewClosed, number)
+	}
+	round.State = ReviewAbandoned
+	round.AbandonReason = reason
+	return nil
+}
+
+func (t *CollectionTask) missingReviewDecisions(round *ReviewRound) []string {
+	decided := map[string]bool{}
+	for _, opinion := range round.Opinions {
+		decided[opinion.RequirementID] = true
+	}
+	var missing []string
+	for _, requirement := range t.Requirements {
+		if !decided[requirement.ID] {
+			missing = append(missing, requirement.ID)
+		}
+	}
+	sort.Strings(missing)
+	return missing
+}
+
+// AssessReviewRound compares an old review with the current chain and
+// material versions. It never rewrites the old round; each item is marked as
+// still applicable or requiring a fresh review.
+func (t *CollectionTask) AssessReviewRound(chain *Chain, number int) (ReviewRoundAssessment, error) {
+	if err := t.checkTrustRoot(chain); err != nil {
+		return ReviewRoundAssessment{}, err
+	}
+	round, err := t.reviewRound(number)
+	if err != nil {
+		return ReviewRoundAssessment{}, err
+	}
+	currentMaterials := map[string]ReviewMaterialVersion{}
+	for _, material := range t.reviewMaterialSnapshot() {
+		currentMaterials[material.RequirementID] = material
+	}
+	opinions := map[string]ReviewOpinion{}
+	for _, opinion := range round.Opinions {
+		opinions[opinion.RequirementID] = opinion
+	}
+	assessment := ReviewRoundAssessment{
+		Number:           round.Number,
+		State:            round.State,
+		CurrentTip:       chain.CanonicalTip().Hash,
+		MissingDecisions: t.missingReviewDecisions(round),
+	}
+	for _, requirement := range t.Requirements {
+		item := ReviewItemAssessment{RequirementID: requirement.ID}
+		frozen, frozenOK := findReviewMaterial(round.Materials, requirement.ID)
+		current := currentMaterials[requirement.ID]
+		if opinion, ok := opinions[requirement.ID]; ok {
+			item.Decision = opinion.Decision
+		}
+		switch {
+		case !frozenOK:
+			item.Applicability = ReviewNeedsReview
+			item.Reason = "requirement was not included in the frozen review material"
+		case !materialVersionEqual(frozen, current):
+			item.Applicability = ReviewNeedsReview
+			item.Reason = "received proof or conflict set changed since the review round opened"
+		case !t.reviewedProofsStillSupported(chain, frozen, round.Basis):
+			item.Applicability = ReviewNeedsReview
+			item.Reason = "canonical chain or confirmation basis no longer supports the reviewed proof"
+		default:
+			item.Applicability = ReviewStillApplicable
+			item.Reason = "same material version remains on the recorded normative basis"
+		}
+		assessment.Items = append(assessment.Items, item)
+	}
+	return assessment, nil
+}
+
+func findReviewMaterial(materials []ReviewMaterialVersion, requirementID string) (ReviewMaterialVersion, bool) {
+	for _, material := range materials {
+		if material.RequirementID == requirementID {
+			return material, true
+		}
+	}
+	return ReviewMaterialVersion{}, false
+}
+
+func materialVersionEqual(left, right ReviewMaterialVersion) bool {
+	return left.PrimaryResultID == right.PrimaryResultID &&
+		left.PrimaryState == right.PrimaryState &&
+		left.UnresolvedConflict == right.UnresolvedConflict &&
+		hashSequenceEqual(left.ConflictResultIDs, right.ConflictResultIDs)
+}
+
+func (t *CollectionTask) reviewedProofsStillSupported(chain *Chain, material ReviewMaterialVersion, basis ReviewBasis) bool {
+	if basis.RequiredConfirmations != t.RequiredConfirmations ||
+		basis.ConsensusRule != fmt.Sprintf("%T", chain.consensus) ||
+		basis.TrustRootHash != chain.anchor.BlockHash {
+		return false
+	}
+	evidence, ok := t.Evidence[material.RequirementID]
+	if !ok {
+		return material.PrimaryResultID == (Hash{})
+	}
+	if evidence.State != EvidenceAccepted || !proofStillSupported(chain, evidence.Result.BlockHash, t.RequiredConfirmations) {
+		return false
+	}
+	for _, conflict := range evidence.Conflicts {
+		if conflict.State == EvidenceAccepted && !proofStillSupported(chain, conflict.Result.BlockHash, t.RequiredConfirmations) {
+			return false
+		}
+	}
+	return true
+}
+
+func proofStillSupported(chain *Chain, blockHash Hash, requiredConfirmations uint64) bool {
+	confirmations, err := chain.Confirmations(blockHash)
+	return err == nil && confirmations >= requiredConfirmations
+}
+
 // Abandon closes the task. Collected evidence and decisions stay available
 // for explanation; no further material is accepted.
 func (t *CollectionTask) Abandon(reason string) {
@@ -483,6 +910,18 @@ func (t *CollectionTask) Explain() string {
 	if t.Abandoned {
 		lines = append(lines, "  abandoned: "+t.AbandonReason)
 	}
+	for _, round := range t.ReviewRounds {
+		lines = append(lines, fmt.Sprintf("  review-round %d: reviewer=%q state=%s tip=%s batches=%d confirmations=%d",
+			round.Number, round.Reviewer, round.State, round.Basis.CanonicalTip.Hex(), round.BatchCount, round.Basis.RequiredConfirmations))
+		lines = append(lines, "    canonical-chain: "+hashListHex(round.Basis.CanonicalChain))
+		for _, opinion := range round.Opinions {
+			lines = append(lines, fmt.Sprintf("    %s: %s evidence=%s comment=%s",
+				opinion.RequirementID, opinion.Decision, opinion.EvidenceResultID.Hex(), opinion.Comment))
+		}
+		if round.State == ReviewAbandoned {
+			lines = append(lines, "    abandoned: "+round.AbandonReason)
+		}
+	}
 	if !t.Complete() {
 		missing := t.Missing()
 		ids := make([]string, 0, len(missing))
@@ -502,4 +941,12 @@ func (t *CollectionTask) Explain() string {
 		}
 	}
 	return strings.Join(lines, "\n")
+}
+
+func hashListHex(hashes []Hash) string {
+	parts := make([]string, 0, len(hashes))
+	for _, hash := range hashes {
+		parts = append(parts, hash.Hex())
+	}
+	return strings.Join(parts, ",")
 }
