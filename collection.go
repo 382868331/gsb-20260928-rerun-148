@@ -119,6 +119,8 @@ type CollectionTask struct {
 	Batches               []EvidenceBatch               `json:"batches"`
 	Evidence              map[string]*CollectedEvidence `json:"evidence"`
 	Decisions             []TaskDecision                `json:"decisions"`
+	ReviewRounds          []ReviewRound                 `json:"reviewRounds,omitempty"`
+	MaterialVersion       int                           `json:"materialVersion,omitempty"`
 	Abandoned             bool                          `json:"abandoned"`
 	AbandonReason         string                        `json:"abandonReason,omitempty"`
 }
@@ -235,6 +237,7 @@ func (t *CollectionTask) SubmitBatch(chain *Chain, source string, proofs []Inclu
 				CurrentResult: result,
 				State:         EvidenceAccepted,
 			}
+			t.MaterialVersion++
 			item.Outcome = ItemAccepted
 			batch.Items = append(batch.Items, item)
 			continue
@@ -253,6 +256,7 @@ func (t *CollectionTask) SubmitBatch(chain *Chain, source string, proofs []Inclu
 			Reason:        "contradicts the evidence already collected for this requirement; first arrival is kept",
 		})
 		existing.setConflictUnresolved()
+		t.MaterialVersion++
 		item.Outcome = ItemConflict
 		batch.Items = append(batch.Items, item)
 	}
@@ -339,10 +343,18 @@ func (t *CollectionTask) Revalidate(chain *Chain) ([]string, error) {
 	var invalidConflicts []string
 	var unresolvedConflicts []string
 	var resolvedConflicts []string
+	materialChanged := false
 	for _, requirement := range t.Requirements {
 		evidence, ok := t.Evidence[requirement.ID]
 		if !ok {
 			continue
+		}
+		previousState := evidence.State
+		previousRecheckReason := evidence.RecheckReason
+		previousConflictState := evidence.ConflictState
+		previousConflictStates := make([]EvidenceState, len(evidence.Conflicts))
+		for i := range evidence.Conflicts {
+			previousConflictStates[i] = evidence.Conflicts[i].State
 		}
 		freshPrimary, err := chain.RecheckResult(evidence.Result, t.RequiredConfirmations)
 		evidence.CurrentResult = freshPrimary
@@ -381,6 +393,19 @@ func (t *CollectionTask) Revalidate(chain *Chain) ([]string, error) {
 		if evidence.State != EvidenceAccepted || evidence.ConflictState == ConflictUnresolved {
 			stale = append(stale, requirement.ID)
 		}
+		if evidence.State != previousState || evidence.RecheckReason != previousRecheckReason || evidence.ConflictState != previousConflictState {
+			materialChanged = true
+		} else {
+			for i := range evidence.Conflicts {
+				if evidence.Conflicts[i].State != previousConflictStates[i] {
+					materialChanged = true
+					break
+				}
+			}
+		}
+	}
+	if materialChanged {
+		t.MaterialVersion++
 	}
 	sort.Strings(stale)
 	sort.Strings(invalidPrimary)
